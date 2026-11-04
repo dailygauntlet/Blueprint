@@ -1,4 +1,5 @@
 # Blueprint
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/79d9a5c3-cce8-46b1-919a-d2ccd5d773ba" />
 
 A UCI chess engine written in C++20.
 
