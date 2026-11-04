@@ -4,14 +4,15 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "perft.h"
 #include "search.h"
 
 // Change these to whatever you like. They're what the GUI (Arena) and CCRL will display.
-constexpr const char* ENGINE_NAME = "MyEngine";
-constexpr const char* ENGINE_AUTHOR = "Your Name";
-constexpr const char* ENGINE_VERSION = "0.1";
+constexpr const char* ENGINE_NAME = "Blueprint";
+constexpr const char* ENGINE_AUTHOR = "Everett Towe";
+constexpr const char* ENGINE_VERSION = "0.3";
 
 // UCI (Universal Chess Interface): the text protocol GUIs use to talk to engines.
 // The GUI sends lines like "position startpos moves e2e4" and "go wtime 60000 btime 60000",
@@ -29,7 +30,7 @@ public:
             if (cmd == "uci") {
                 std::cout << "id name " << ENGINE_NAME << " " << ENGINE_VERSION << "\n"
                           << "id author " << ENGINE_AUTHOR << "\n"
-                          << "option name Hash type spin default 16 min 1 max 4096\n"
+                          << "option name Hash type spin default 256 min 1 max 4096\n"
                           << "option name Move Overhead type spin default 30 min 0 max 5000\n"
                           << "uciok" << std::endl;
             } else if (cmd == "isready") {
@@ -50,6 +51,11 @@ public:
             } else if (cmd == "quit") {
                 stopSearch();
                 return;
+            } else if (cmd == "status") {  // used by the match runner to detect game results
+                printStatus();
+            } else if (cmd == "moves") {  // list legal moves (used by the match runner for random openings)
+                for (Move m : legalMoves(pos)) std::cout << moveToString(m) << " ";
+                std::cout << std::endl;
             } else if (cmd == "perft" || cmd == "divide") {  // handy debugging commands
                 int d = 1;
                 is >> d;
@@ -65,6 +71,38 @@ private:
     std::atomic<bool> stopFlag{false};
     std::thread worker;
     int moveOverhead = 30;
+
+    static std::vector<Move> legalMoves(Position& p) {
+        std::vector<Move> out;
+        MoveList list;
+        p.generate(list);
+        for (int i = 0; i < list.count; i++) {
+            State st;
+            p.makeMove(list.moves[i], st);
+            if (p.lastMoveLegal()) out.push_back(list.moves[i]);
+            p.unmakeMove(list.moves[i], st);
+        }
+        return out;
+    }
+
+    void printStatus() {
+        std::string status = "ongoing";
+        if (legalMoves(pos).empty()) {
+            status = pos.inCheck() ? "checkmate" : "stalemate";
+        } else if (pos.halfmove >= 100) {
+            status = "draw50";
+        } else if (!(pos.byType[PAWN] | pos.byType[ROOK] | pos.byType[QUEEN]) &&
+                   popcount(pos.byType[KNIGHT] | pos.byType[BISHOP]) <= 1) {
+            status = "insufficient";
+        } else {
+            int count = 0;
+            int limit = std::max(0, pos.histLen - pos.halfmove);
+            for (int i = pos.histLen - 2; i >= limit; i -= 2)
+                if (pos.hist[i] == pos.key) count++;
+            if (count >= 2) status = "drawrep";
+        }
+        std::cout << "status " << status << std::endl;
+    }
 
     void stopSearch() {
         stopFlag = true;

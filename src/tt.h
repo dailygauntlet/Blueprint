@@ -27,7 +27,7 @@ struct TTEntry {
 
 class TT {
 public:
-    TT() { resize(16); }
+    TT() { resize(256); }
 
     void resize(size_t megabytes) {
         size_t entries = megabytes * 1024 * 1024 / sizeof(TTEntry);

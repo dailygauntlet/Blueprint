@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 
@@ -22,7 +23,11 @@ struct SearchLimits {
 
 class Searcher {
 public:
-    Searcher(TT& table, std::atomic<bool>& stopFlag) : tt(table), stop(stopFlag) {}
+    Searcher(TT& table, std::atomic<bool>& stopFlag) : tt(table), stop(stopFlag) {
+        // Late-move-reduction table: later moves at higher depth get reduced more.
+        for (int d = 1; d < 64; d++)
+            for (int m = 1; m < 64; m++) lmr[d][m] = int(0.75 + std::log(d) * std::log(m) / 2.25);
+    }
 
     // Searches the position and returns the best move found (NULL_MOVE if there are no legal moves).
     Move search(Position& pos, const SearchLimits& limits) {
@@ -34,15 +39,39 @@ public:
         tt.newSearch();
 
         Move best = NULL_MOVE;
+        int prevScore = 0;
         const int maxDepth = lim.maxDepth > 0 ? std::min(lim.maxDepth, MAX_PLY - 1) : MAX_PLY - 1;
 
         // Iterative deepening: search depth 1, then 2, then 3, ... Each pass is cheap compared to the
         // next, and the earlier results make move ordering much better in the later ones.
         for (int depth = 1; depth <= maxDepth; depth++) {
-            int score = negamax(pos, depth, -INF, INF, 0);
+            // Aspiration window: guess the score will be close to last depth's, search with a narrow
+            // window (much faster), and widen it if the guess turns out wrong.
+            int alpha = -INF, beta = INF, delta = 25;
+            if (depth >= 5) {
+                alpha = std::max(prevScore - delta, -INF);
+                beta = std::min(prevScore + delta, INF);
+            }
+            int score;
+            for (;;) {
+                score = negamax(pos, depth, alpha, beta, 0);
+                if (stopped) break;
+                if (score <= alpha) {  // fail low: real score is lower than the window
+                    beta = (alpha + beta) / 2;
+                    alpha = std::max(score - delta, -INF);
+                } else if (score >= beta) {  // fail high
+                    beta = std::min(score + delta, INF);
+                } else {
+                    break;
+                }
+                delta += delta / 2 + 5;
+                if (alpha < -2000) alpha = -INF;
+                if (beta > 2000) beta = INF;
+            }
             if (stopped) break;  // this depth was cut short: throw it away, keep the previous result
             completedDepth = depth;
             best = pv[0][0];
+            prevScore = score;
             printInfo(depth, score);
             if (lim.softMs && elapsedMs() >= lim.softMs / 2) break;
         }
@@ -64,6 +93,11 @@ private:
     int pvLen[MAX_PLY + 2];
     Move killers[MAX_PLY + 2][2] = {};
     int history[2][64][64] = {};
+    int lmr[64][64] = {};
+
+    static bool hasNonPawnMaterial(const Position& pos, int c) {
+        return pos.byColor[c] & ~(pos.byType[PAWN] | pos.byType[KING]);
+    }
 
     int64_t elapsedMs() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
@@ -217,7 +251,7 @@ private:
 
     // ---- main search (negamax form of alpha-beta with principal variation search) ----
     // Returns the score from the point of view of the side to move.
-    int negamax(Position& pos, int depth, int alpha, int beta, int ply) {
+    int negamax(Position& pos, int depth, int alpha, int beta, int ply, bool allowNull = true) {
         pvLen[ply] = ply;
         if (stopped) return 0;
 
@@ -251,6 +285,26 @@ private:
             }
         }
 
+        // Pruning that happens before searching any move (never at PV nodes or when in check)
+        if (!pvNode && !inCheck && std::abs(beta) < MATE_BOUND) {
+            const int staticEval = evaluate(pos);
+
+            // Reverse futility pruning: we're so far above beta that the opponent won't allow this.
+            if (depth <= 6 && staticEval - 90 * depth >= beta) return staticEval;
+
+            // Null-move pruning: if even passing our turn leaves us above beta, searching our
+            // real moves would surely do too. (Skipped with only pawns left: zugzwang danger.)
+            if (allowNull && depth >= 3 && staticEval >= beta && hasNonPawnMaterial(pos, pos.stm)) {
+                int R = 3 + depth / 6 + std::min((staticEval - beta) / 200, 2);
+                State nst;
+                pos.makeNullMove(nst);
+                int score = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
+                pos.unmakeNullMove(nst);
+                if (stopped) return 0;
+                if (score >= beta) return score > MATE_BOUND ? beta : score;
+            }
+        }
+
         MoveList list;
         pos.generate(list);
         int scores[256];
@@ -280,14 +334,27 @@ private:
             }
             legal++;
 
+            const bool quiet = !isCapture(m) && !isPromotion(m);
+            const int newDepth = depth - 1;
             int score;
             if (legal == 1) {
-                score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                score = -negamax(pos, newDepth, -beta, -alpha, ply + 1);
             } else {
-                // PVS: assume this move is worse than the first; check with a cheap zero-width window,
+                // Late move reductions: moves late in the ordering are rarely best, so search them
+                // to a reduced depth first and only look deeper if they surprise us.
+                int r = 0;
+                if (depth >= 3 && legal >= 3 && quiet && !inCheck) {
+                    r = lmr[std::min(depth, 63)][std::min(legal, 63)];
+                    if (pvNode) r--;
+                    if (m == killers[ply][0] || m == killers[ply][1]) r--;
+                    if (pos.inCheck()) r = 0;  // the move gives check: don't reduce
+                    r = std::max(0, std::min(r, newDepth - 1));
+                }
+                // PVS: assume this move is worse than the first; check with a zero-width window,
                 // and only do the full search if it turns out to be better.
-                score = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1);
-                if (score > alpha && score < beta) score = -negamax(pos, depth - 1, -beta, -alpha, ply + 1);
+                score = -negamax(pos, newDepth - r, -alpha - 1, -alpha, ply + 1);
+                if (r > 0 && score > alpha) score = -negamax(pos, newDepth, -alpha - 1, -alpha, ply + 1);
+                if (score > alpha && score < beta) score = -negamax(pos, newDepth, -beta, -alpha, ply + 1);
             }
             pos.unmakeMove(m, st);
             if (stopped) return 0;

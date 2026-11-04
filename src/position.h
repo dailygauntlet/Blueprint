@@ -217,6 +217,24 @@ struct Position {
         histLen--;
     }
 
+    // "Null move": pass the turn without moving. Only used by the search for pruning.
+    void makeNullMove(State& st) {
+        st = {castling, ep, halfmove, NO_PIECE, key};
+        hist[histLen++] = key;
+        if (ep >= 0) key ^= Zobrist::epFile[ep & 7];
+        ep = -1;
+        halfmove++;
+        key ^= Zobrist::side;
+        stm ^= 1;
+    }
+    void unmakeNullMove(const State& st) {
+        stm ^= 1;
+        ep = st.ep;
+        halfmove = st.halfmove;
+        key = st.key;
+        histLen--;
+    }
+
     // True if the current position already occurred earlier (only positions since the last
     // capture or pawn move can match, so we only look back `halfmove` plies).
     bool isRepetition() const {
