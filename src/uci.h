@@ -12,7 +12,7 @@
 // Change these to whatever you like. They're what the GUI (Arena) and CCRL will display.
 constexpr const char* ENGINE_NAME = "Blueprint";
 constexpr const char* ENGINE_AUTHOR = "Everett Towe";
-constexpr const char* ENGINE_VERSION = "0.3";
+constexpr const char* ENGINE_VERSION = "0.4";
 
 // UCI (Universal Chess Interface): the text protocol GUIs use to talk to engines.
 // The GUI sends lines like "position startpos moves e2e4" and "go wtime 60000 btime 60000",
