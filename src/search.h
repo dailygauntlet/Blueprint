@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 #include "eval.h"
 #include "tt.h"
@@ -21,13 +22,78 @@ struct SearchLimits {
     uint64_t maxNodes = 0;
 };
 
+// Squares attacking `sq`, for both colours, given an occupancy (used to "x-ray" through removed pieces).
+inline U64 attackersTo(const Position& pos, int sq, U64 occ) {
+    return (pawnAttacks[BLACK][sq] & pos.byType[PAWN] & pos.byColor[WHITE]) |
+           (pawnAttacks[WHITE][sq] & pos.byType[PAWN] & pos.byColor[BLACK]) |
+           (knightAttacks[sq] & pos.byType[KNIGHT]) | (kingAttacks[sq] & pos.byType[KING]) |
+           (bishopAttacks(sq, occ) & (pos.byType[BISHOP] | pos.byType[QUEEN])) |
+           (rookAttacks(sq, occ) & (pos.byType[ROOK] | pos.byType[QUEEN]));
+}
+
+constexpr int SEE_VALUE[6] = {100, 320, 330, 500, 900, 20000};
+
+// Static Exchange Evaluation: play out the whole sequence of captures on the destination square,
+// each side always recapturing with its cheapest piece (and free to stop whenever that's better),
+// and return the net material result in centipawns for the side making the move.
+inline int see(const Position& pos, Move m) {
+    const int from = moveFrom(m), to = moveTo(m), flags = moveFlags(m);
+    const int us = colorOf(pos.board[from]);
+    int onSquare = typeOf(pos.board[from]);  // the piece currently "standing" on the square
+    int gain[34];
+    int d = 0;
+    U64 occ = pos.occupied() ^ bit(from);
+    if (flags == EP_CAPTURE) {
+        gain[0] = SEE_VALUE[PAWN];
+        occ ^= bit(to + (us == WHITE ? -8 : 8));
+    } else if (isCapture(m)) {
+        gain[0] = SEE_VALUE[typeOf(pos.board[to])];
+    } else {
+        gain[0] = 0;
+    }
+    if (isPromotion(m)) {
+        gain[0] += SEE_VALUE[promoType(m)] - SEE_VALUE[PAWN];
+        onSquare = promoType(m);
+    }
+    U64 attackers = attackersTo(pos, to, occ) & occ;
+    int side = us ^ 1;
+    for (;;) {
+        U64 mine = attackers & pos.byColor[side];
+        if (!mine) break;
+        int t = PAWN;
+        while (!(mine & pos.byType[t])) t++;  // cheapest attacker first
+        U64 b = mine & pos.byType[t];
+        b &= -b;
+        if (t == KING && (attackers & ~b & pos.byColor[side ^ 1])) break;  // king can't capture into a defended square
+        d++;
+        gain[d] = SEE_VALUE[onSquare] - gain[d - 1];
+        if (std::max(-gain[d - 1], gain[d]) < 0) break;  // neither side can improve: stop early
+        occ ^= b;
+        onSquare = t;
+        attackers = attackersTo(pos, to, occ) & occ;
+        side ^= 1;
+    }
+    while (d > 0) {
+        gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+        d--;
+    }
+    return gain[0];
+}
+
 class Searcher {
 public:
     Searcher(TT& table, std::atomic<bool>& stopFlag) : tt(table), stop(stopFlag) {
         // Late-move-reduction table: later moves at higher depth get reduced more.
         for (int d = 1; d < 64; d++)
             for (int m = 1; m < 64; m++) lmr[d][m] = int(0.75 + std::log(d) * std::log(m) / 2.25);
+        for (int i = 0; i < MAX_PLY + 2; i++) {
+            movedPiece[i] = NO_PIECE;
+            movedTo[i] = 0;
+            stackEval[i] = -INF;
+        }
     }
+
+    bool verbose = true;  // print "info" lines (turned off by the data generator)
 
     // Searches the position and returns the best move found (NULL_MOVE if there are no legal moves).
     Move search(Position& pos, const SearchLimits& limits) {
@@ -80,6 +146,8 @@ public:
         return best;
     }
 
+    int score() const { return lastScore; }  // score (side-to-move view) of the last completed depth
+
 private:
     TT& tt;
     std::atomic<bool>& stop;
@@ -88,12 +156,24 @@ private:
     uint64_t nodes = 0;
     bool stopped = false;
     int completedDepth = 0;
+    int lastScore = 0;
 
     Move pv[MAX_PLY + 2][MAX_PLY + 2];  // triangular principal-variation table
     int pvLen[MAX_PLY + 2];
     Move killers[MAX_PLY + 2][2] = {};
     int history[2][64][64] = {};
     int lmr[64][64] = {};
+
+    // "Continuation history": how well a quiet move has worked as a reply to the previous move
+    // (indexed by previous piece+square, then this piece+square). Heap allocated: it is big.
+    std::vector<int16_t> contHist = std::vector<int16_t>(12 * 64 * 12 * 64, 0);
+    int movedPiece[MAX_PLY + 2];  // piece moved at each ply of the current line (NO_PIECE after a null move)
+    int movedTo[MAX_PLY + 2];
+    int stackEval[MAX_PLY + 2];  // static evaluation at each ply, to tell if the position is improving
+
+    static int contIndex(int prevPiece, int prevTo, int piece, int to) {
+        return ((prevPiece * 64 + prevTo) * 12 + piece) * 64 + to;
+    }
 
     static bool hasNonPawnMaterial(const Position& pos, int c) {
         return pos.byColor[c] & ~(pos.byType[PAWN] | pos.byType[KING]);
@@ -124,6 +204,8 @@ private:
     }
 
     void printInfo(int depth, int score) {
+        lastScore = score;
+        if (!verbose) return;
         int64_t ms = elapsedMs();
         uint64_t nps = ms > 0 ? nodes * 1000 / ms : 0;
         std::cout << "info depth " << depth << " score ";
@@ -152,7 +234,7 @@ private:
     }
 
     // ---- move ordering: try the likely-best moves first so alpha-beta can cut off sooner ----
-    int scoreMove(const Position& pos, Move m, Move ttMove, int ply) const {
+    int scoreMove(const Position& pos, Move m, Move ttMove, int ply, bool useSee = true) const {
         static const int VICTIM[6] = {1, 3, 3, 5, 9, 0};
         if (m == ttMove) return 10000000;
         int flags = moveFlags(m);
@@ -160,32 +242,51 @@ private:
             int s = 200000;
             if (isCapture(m)) {
                 int victim = flags == EP_CAPTURE ? PAWN : typeOf(pos.board[moveTo(m)]);
+                int attacker = typeOf(pos.board[moveFrom(m)]);
                 // MVV-LVA: most valuable victim first, then least valuable attacker
-                s += VICTIM[victim] * 16 - typeOf(pos.board[moveFrom(m)]);
+                s += VICTIM[victim] * 16 - attacker;
+                // Captures that lose material (by SEE) are tried after the quiet moves.
+                if (useSee && !isPromotion(m) && SEE_VALUE[attacker] > SEE_VALUE[victim] && see(pos, m) < 0)
+                    s -= 300000;
             }
             if (isPromotion(m)) s += (promoType(m) == QUEEN) ? 1500 : -300000;  // underpromotions last
             return s;
         }
         if (m == killers[ply][0]) return 150000;
         if (m == killers[ply][1]) return 140000;
-        return history[pos.stm][moveFrom(m)][moveTo(m)];
+        int h = history[pos.stm][moveFrom(m)][moveTo(m)];
+        if (ply >= 1 && movedPiece[ply - 1] != NO_PIECE)
+            h += contHist[contIndex(movedPiece[ply - 1], movedTo[ply - 1], pos.board[moveFrom(m)], moveTo(m))];
+        return h;
     }
 
     void updateHistory(int color, Move m, int bonus) {
         int& h = history[color][moveFrom(m)][moveTo(m)];
         h += bonus - h * std::abs(bonus) / 16384;
     }
+    void updateCont(int idx, int bonus) {
+        int v = contHist[idx];
+        v += bonus - v * std::abs(bonus) / 16384;
+        contHist[idx] = int16_t(v);
+    }
 
     // A quiet move caused a beta cutoff: remember it (killer + history), and penalise the quiet
-    // moves we tried before it that did not work.
-    void rewardQuiet(int color, Move best, const Move* quiets, int nq, int depth, int ply) {
+    // moves we tried before it that did not work. Called with the position BEFORE the moves.
+    void rewardQuiet(const Position& pos, Move best, const Move* quiets, int nq, int depth, int ply) {
+        const int color = pos.stm;
         if (killers[ply][0] != best) {
             killers[ply][1] = killers[ply][0];
             killers[ply][0] = best;
         }
+        const bool havePrev = ply >= 1 && movedPiece[ply - 1] != NO_PIECE;
+        auto update = [&](Move m, int bonus) {
+            updateHistory(color, m, bonus);
+            if (havePrev)
+                updateCont(contIndex(movedPiece[ply - 1], movedTo[ply - 1], pos.board[moveFrom(m)], moveTo(m)), bonus);
+        };
         int bonus = std::min(depth * depth, 1200);
-        updateHistory(color, best, bonus);
-        for (int i = 0; i < nq; i++) updateHistory(color, quiets[i], -bonus);
+        update(best, bonus);
+        for (int i = 0; i < nq; i++) update(quiets[i], -bonus);
     }
 
     // ---- quiescence search: keep playing captures until the position is "quiet" ----
@@ -213,8 +314,13 @@ private:
         for (int i = 0; i < all.count; i++) {
             Move m = all.moves[i];
             if (!inCheck && !isCapture(m) && moveFlags(m) != PROMO_Q) continue;
+            // Don't bother with captures that lose material outright (SEE < 0)
+            if (!inCheck && isCapture(m) && !isPromotion(m)) {
+                int victim = moveFlags(m) == EP_CAPTURE ? PAWN : typeOf(pos.board[moveTo(m)]);
+                if (SEE_VALUE[typeOf(pos.board[moveFrom(m)])] > SEE_VALUE[victim] && see(pos, m) < 0) continue;
+            }
             moves[n] = m;
-            scores[n] = scoreMove(pos, m, NULL_MOVE, ply);
+            scores[n] = scoreMove(pos, m, NULL_MOVE, ply, false);
             n++;
         }
 
@@ -226,6 +332,8 @@ private:
             std::swap(moves[i], moves[bi]);
             std::swap(scores[i], scores[bi]);
 
+            movedPiece[ply] = pos.board[moveFrom(moves[i])];
+            movedTo[ply] = moveTo(moves[i]);
             State st;
             pos.makeMove(moves[i], st);
             if (!pos.lastMoveLegal()) {
@@ -285,18 +393,23 @@ private:
             }
         }
 
+        // Static evaluation, and whether it is better than two plies ago ("improving"): if our position
+        // is getting better we prune less, if it's getting worse we prune and reduce more.
+        const int staticEval = inCheck ? -INF : evaluate(pos);
+        stackEval[ply] = staticEval;
+        const bool improving = !inCheck && ply >= 2 && stackEval[ply - 2] != -INF && staticEval > stackEval[ply - 2];
+
         // Pruning that happens before searching any move (never at PV nodes or when in check)
         if (!pvNode && !inCheck && std::abs(beta) < MATE_BOUND) {
-            const int staticEval = evaluate(pos);
-
             // Reverse futility pruning: we're so far above beta that the opponent won't allow this.
-            if (depth <= 6 && staticEval - 90 * depth >= beta) return staticEval;
+            if (depth <= 6 && staticEval - (90 * depth - (improving ? 40 : 0)) >= beta) return staticEval;
 
             // Null-move pruning: if even passing our turn leaves us above beta, searching our
             // real moves would surely do too. (Skipped with only pawns left: zugzwang danger.)
             if (allowNull && depth >= 3 && staticEval >= beta && hasNonPawnMaterial(pos, pos.stm)) {
                 int R = 3 + depth / 6 + std::min((staticEval - beta) / 200, 2);
                 State nst;
+                movedPiece[ply] = NO_PIECE;
                 pos.makeNullMove(nst);
                 int score = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
                 pos.unmakeNullMove(nst);
@@ -326,6 +439,8 @@ private:
             std::swap(scores[i], scores[bi]);
             const Move m = list.moves[i];
 
+            movedPiece[ply] = pos.board[moveFrom(m)];
+            movedTo[ply] = moveTo(m);
             State st;
             pos.makeMove(m, st);
             if (!pos.lastMoveLegal()) {
@@ -347,6 +462,7 @@ private:
                     r = lmr[std::min(depth, 63)][std::min(legal, 63)];
                     if (pvNode) r--;
                     if (m == killers[ply][0] || m == killers[ply][1]) r--;
+                    if (!improving) r++;
                     if (pos.inCheck()) r = 0;  // the move gives check: don't reduce
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
@@ -368,7 +484,7 @@ private:
                     for (int j = ply + 1; j < pvLen[ply + 1]; j++) pv[ply][j] = pv[ply + 1][j];
                     pvLen[ply] = pvLen[ply + 1];
                     if (alpha >= beta) {  // beta cutoff: the opponent would never allow this position
-                        if (!isCapture(m) && !isPromotion(m)) rewardQuiet(pos.stm, m, quiets, nq, depth, ply);
+                        if (!isCapture(m) && !isPromotion(m)) rewardQuiet(pos, m, quiets, nq, depth, ply);
                         break;
                     }
                 }

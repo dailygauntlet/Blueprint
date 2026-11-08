@@ -5,6 +5,11 @@
 #include "attacks.h"
 #include "types.h"
 
+// Size of the game-history buffer used for repetition detection (tools that only evaluate positions shrink it).
+#ifndef BP_MAX_HIST
+#define BP_MAX_HIST 2048
+#endif
+
 struct MoveList {
     Move moves[256];
     int count = 0;
@@ -54,7 +59,7 @@ struct Position {
     U64 key = 0;
 
     // Keys of every earlier position in the game (and search), used to detect repetitions.
-    static constexpr int MAX_HIST = 2048;
+    static constexpr int MAX_HIST = BP_MAX_HIST;
     U64 hist[MAX_HIST];
     int histLen = 0;
 
@@ -130,6 +135,36 @@ struct Position {
         if (ep >= 0) key ^= Zobrist::epFile[ep & 7];
         if (stm == BLACK) key ^= Zobrist::side;
         return true;
+    }
+
+    std::string fen() const {
+        std::string s;
+        for (int r = 7; r >= 0; r--) {
+            int empty = 0;
+            for (int f = 0; f < 8; f++) {
+                int pc = board[r * 8 + f];
+                if (pc == NO_PIECE) {
+                    empty++;
+                } else {
+                    if (empty) s += char('0' + empty);
+                    empty = 0;
+                    s += "PNBRQKpnbrqk"[pc];
+                }
+            }
+            if (empty) s += char('0' + empty);
+            if (r) s += '/';
+        }
+        s += (stm == WHITE) ? " w " : " b ";
+        std::string c;
+        if (castling & WK_CASTLE) c += 'K';
+        if (castling & WQ_CASTLE) c += 'Q';
+        if (castling & BK_CASTLE) c += 'k';
+        if (castling & BQ_CASTLE) c += 'q';
+        s += c.empty() ? "-" : c;
+        s += ' ';
+        s += (ep >= 0) ? squareName(ep) : std::string("-");
+        s += ' ' + std::to_string(halfmove) + ' ' + std::to_string(fullmove);
+        return s;
     }
 
     // ---- attack detection ----
