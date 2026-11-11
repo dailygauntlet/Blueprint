@@ -6,7 +6,7 @@ A UCI chess engine written in C++20.
 
 
 - **Author:** Everett Towe (United States)
-- **Version:** 0.5
+- **Version:** 0.5.1
 - **License:** MIT (see `LICENSE`)
 - **Development:** written with AI assistance (Claude, by Anthropic), directed and tested by the author.
 - **Protocol:** UCI. It needs a GUI such as Arena, Cute Chess or En Croissant.
