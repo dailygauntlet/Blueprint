@@ -481,10 +481,26 @@ inline int evalImpl(const Position& pos, Eval::Trace* tr) {
         }
     }
 
+    // Mop-up: with a big material edge against a king that has no pawns and at most one minor piece,
+    // the stronger side must actually deliver mate: drive the lone king to the edge, bring our king close.
+    int mopUp = 0;
+    {
+        const int strong = npm[WHITE] > npm[BLACK] ? WHITE : BLACK, weak = strong ^ 1;
+        if (npm[strong] - npm[weak] >= 400 && npm[weak] <= 330 && !pos.pieces(weak, PAWN)) {
+            const int wk = kingSq[weak], sk = kingSq[strong];
+            const int wf = wk % 8, wr = wk / 8;
+            const int centreDist = std::max(3 - wf, wf - 4) + std::max(3 - wr, wr - 4);  // 0 (centre) .. 6 (corner)
+            const int kingDist = std::max(std::abs(wf - sk % 8), std::abs(wr - sk / 8));  // 1 .. 7
+            mopUp = 10 * centreDist + 6 * (7 - kingDist);
+            if (strong == BLACK) mopUp = -mopUp;
+        }
+    }
+    score += mopUp;
+
     if constexpr (TRACE) {
         tr->phase = phase;
         tr->mult = mult;
-        tr->offset = mult * float(dangerMg * phase + dangerEg * (TOTAL_PHASE - phase)) / float(TOTAL_PHASE);
+        tr->offset = mult * float(dangerMg * phase + dangerEg * (TOTAL_PHASE - phase)) / float(TOTAL_PHASE) + mopUp;
         tr->tempoSign = (pos.stm == WHITE) ? 1 : -1;
     }
     return (pos.stm == WHITE ? score : -score) + p.tempo;

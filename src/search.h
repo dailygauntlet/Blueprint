@@ -393,6 +393,12 @@ private:
             }
         }
 
+#ifdef BP_EXP_IIR
+        // Experimental (build with -DBP_EXP_IIR): internal iterative reduction. With no stored best move to
+        // try first, this position has probably not been explored much, so search it a little shallower.
+        if (depth >= 4 && ttMove == NULL_MOVE) depth--;
+#endif
+
         // Static evaluation, and whether it is better than two plies ago ("improving"): if our position
         // is getting better we prune less, if it's getting worse we prune and reduce more.
         const int staticEval = inCheck ? -INF : evaluate(pos);
@@ -463,6 +469,14 @@ private:
                     if (pvNode) r--;
                     if (m == killers[ply][0] || m == killers[ply][1]) r--;
                     if (!improving) r++;
+#ifdef BP_EXP_HLMR
+                    // Experimental (build with -DBP_EXP_HLMR): reduce less for quiet moves with a good history
+                    const int hs = scores[i];  // for plain quiet moves this is their history score
+                    if (hs > -100000 && hs < 100000) {
+                        if (hs > 6000) r--;
+                        else if (hs < -4000) r++;
+                    }
+#endif
                     if (pos.inCheck()) r = 0;  // the move gives check: don't reduce
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
